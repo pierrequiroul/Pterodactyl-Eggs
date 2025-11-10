@@ -1,0 +1,86 @@
+{
+  "_comment": "DO NOT EDIT: FILE GENERATED AUTOMATICALLY BY PTERODACTYL PANEL - v1.0.0",
+  "meta": {
+    "version": "PTDL_v2",
+    "update_url": null
+  },
+  "exported_at": "2025-11-09T12:00:00+00:00",
+  "name": "Certbot (DNS-01 Cloudflare)",
+  "author": "you@example.com",
+  "description": "Génère/renouvelle des certificats Let's Encrypt (wildcard) via DNS-01 Cloudflare. Scripts robustes, venv auto-bootstrappé au démarrage, Certbot 5.x via API interne.",
+  "features": null,
+  "docker_images": {
+    "Debian + Python": "ghcr.io/parkervcp/yolks:debian"
+  },
+  "file_denylist": [],
+  "startup": "/bin/bash /home/container/start.sh",
+  "config": {
+    "files": "{}",
+    "startup": "{\r\n    \"done\": \"CERTBOT_START_COMPLETE\"\r\n}",
+    "logs": "{}",
+    "stop": "exit 0"
+  },
+  "scripts": {
+    "installation": {
+      "script": "#!/bin/bash\nset -euo pipefail\n\n##\n## Installation script (exécuté en tant que root dans le container d'installation)\n##\n\necho \"[Install] Installation des dépendances système...\"\napt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n  python3 \\\n  python3-venv \\\n  python3-pip \\\n  ca-certificates \\\n  curl \\\n  bash\n\necho \"[Install] Création du venv Python dans /mnt/server/.venv...\"\ncd /mnt/server\npython3 -m venv .venv\n\necho \"[Install] Installation de certbot + plugin Cloudflare...\"\nsource .venv/bin/activate\npip install --upgrade pip setuptools wheel\npip install certbot certbot-dns-cloudflare\n\necho \"[Install] Création du script start.sh...\"\ncat >/mnt/server/start.sh <<'EOS'\n#!/bin/bash\nset -euo pipefail\ncd /home/container\n\n# ---------- Validation des variables ----------\n[ -n \"${EMAIL:-}\" ] || { echo \"[ERROR] Variable EMAIL manquante\" >&2; exit 1; }\n[ -n \"${DOMAINS:-}\" ] || { echo \"[ERROR] Variable DOMAINS manquante (ex: example.com,*.example.com)\" >&2; exit 1; }\n[ -n \"${CF_API_TOKEN:-}\" ] || { echo \"[ERROR] Variable CF_API_TOKEN manquante\" >&2; exit 1; }\n\necho \"[Certbot] Démarrage...\"\n\n# ---------- Activation du venv ----------\nif [ ! -d \".venv\" ]; then\n  echo \"[ERROR] venv non trouvé, réinstallez l'egg\" >&2\n  exit 1\nfi\nsource .venv/bin/activate\nPYBIN=\"/home/container/.venv/bin/python\"\n\n# ---------- Dossiers persistants ----------\nmkdir -p /home/container/letsencrypt /home/container/work /home/container/logs\nmkdir -p /home/container/.local/share /home/container/.config /home/container/.cache\nexport XDG_DATA_HOME=/home/container/.local/share\nexport XDG_CONFIG_HOME=/home/container/.config\nexport XDG_CACHE_HOME=/home/container/.cache\n\n# ---------- Credentials Cloudflare ----------\numask 077\nprintf \"dns_cloudflare_api_token = %s\\\\n\" \"$CF_API_TOKEN\" > /home/container/credentials.ini\nchmod 600 /home/container/credentials.ini\n\n# ---------- Construire la liste des domaines ----------\nDOMAINS_ARGS=\"\"\nIFS=',' read -r -a DOMS <<< \"$DOMAINS\"\nfor d in \"${DOMS[@]}\"; do\n  d_clean=\"$(echo \"$d\" | tr -d '\"' | xargs)\"\n  [ -n \"$d_clean\" ] && DOMAINS_ARGS=\"$DOMAINS_ARGS -d $d_clean\"\ndone\n[ -n \"$DOMAINS_ARGS\" ] || { echo \"[ERROR] Aucun domaine valide dans DOMAINS\" >&2; exit 1; }\n\necho \"[Certbot] Domaines: $DOMAINS_ARGS\"\necho \"[Certbot] Email: $EMAIL\"\necho \"[Certbot] Staging: ${STAGING:-0}\"\necho \"[Certbot] DNS Propagation: ${DNS_PROPAGATION_SECONDS:-60}s\"\n\n# ---------- Exécution Certbot via API Python ----------\nset +e\n\"$PYBIN\" - <<'PY'\nimport os, shlex, sys\ntry:\n    from certbot._internal.main import main\nexcept ImportError:\n    print(\"[ERROR] Certbot non installé, réinstallez l'egg\", file=sys.stderr)\n    sys.exit(1)\n\ndef need(name):\n    v = os.environ.get(name)\n    if not v:\n        print(f\"[ERROR] Variable {name} manquante\", file=sys.stderr)\n        sys.exit(1)\n    return v\n\nemail = need(\"EMAIL\")\nstaging = os.environ.get(\"STAGING\", \"0\") == \"1\"\ndns_prop = os.environ.get(\"DNS_PROPAGATION_SECONDS\", \"60\")\ncred = \"/home/container/credentials.ini\"\nraw_domains = need(\"DOMAINS\")\n\ndoms = [x.strip().strip('\"') for x in raw_domains.split(',') if x.strip().strip('\"')]\nif not doms:\n    print(\"[ERROR] Aucun domaine valide après parsing\", file=sys.stderr)\n    sys.exit(1)\n\nargs = [\n    \"certonly\",\n    \"--config-dir\", \"/home/container/letsencrypt\",\n    \"--work-dir\", \"/home/container/work\",\n    \"--logs-dir\", \"/home/container/logs\",\n    \"--agree-tos\",\n    \"--non-interactive\",\n    \"--email\", email,\n    \"--dns-cloudflare\",\n    \"--dns-cloudflare-credentials\", cred,\n    \"--dns-cloudflare-propagation-seconds\", dns_prop,\n]\n\nif staging:\n    args.append(\"--staging\")\n\nfor d in doms:\n    args.extend([\"-d\", d])\n\nprint(\"[Certbot] Commande:\", \" \".join(shlex.quote(a) for a in args))\nrc = main(args)\nsys.exit(rc)\nPY\nRC=$?\nset -e\n\nif [ $RC -eq 0 ]; then\n  echo \"[Certbot] ✓ Certificat généré avec succès\"\n  echo \"[Certbot] Certificats disponibles dans: /home/container/letsencrypt/live/\"\n  ls -lh /home/container/letsencrypt/live/ 2>/dev/null || true\nelse\n  echo \"[Certbot] ✗ Échec (code: $RC)\"\n  echo \"[Certbot] Logs disponibles dans: /home/container/logs/\"\nfi\n\necho \"CERTBOT_START_COMPLETE\"\n\n# ---------- Keep alive ----------\nif [ \"${KEEP_ALIVE:-1}\" = \"1\" ]; then\n  echo \"[Certbot] Container en attente (KEEP_ALIVE=1)\"\n  echo \"[Certbot] Pour renouveler: bash /home/container/renew.sh\"\n  tail -f /dev/null\nelse\n  echo \"[Certbot] Arrêt (KEEP_ALIVE=0)\"\n  exit 0\nfi\nEOS\nchmod +x /mnt/server/start.sh\n\necho \"[Install] Création du script renew.sh...\"\ncat >/mnt/server/renew.sh <<'EOS'\n#!/bin/bash\nset -euo pipefail\ncd /home/container\n\nif [ ! -d \".venv\" ]; then\n  echo \"[ERROR] venv non trouvé\" >&2\n  exit 1\nfi\n\nsource .venv/bin/activate\nPYBIN=\"/home/container/.venv/bin/python\"\nexport XDG_DATA_HOME=/home/container/.local/share\nexport XDG_CONFIG_HOME=/home/container/.config\nexport XDG_CACHE_HOME=/home/container/.cache\n\necho \"[Renew] Renouvellement des certificats...\"\n\"$PYBIN\" - <<'PY'\nimport os, sys\ntry:\n    from certbot._internal.main import main\nexcept ImportError:\n    print(\"[ERROR] Certbot non installé\", file=sys.stderr)\n    sys.exit(1)\n\nargs = [\n    \"renew\",\n    \"--config-dir\", \"/home/container/letsencrypt\",\n    \"--work-dir\", \"/home/container/work\",\n    \"--logs-dir\", \"/home/container/logs\",\n    \"--dns-cloudflare-credentials\", \"/home/container/credentials.ini\",\n    \"--dns-cloudflare-propagation-seconds\", os.environ.get(\"DNS_PROPAGATION_SECONDS\", \"60\"),\n    \"--deploy-hook\", \"/bin/bash /home/container/post_renew.sh\",\n]\n\nprint(\"[Renew] Exécution de certbot renew...\")\nrc = main(args)\nif rc == 0:\n    print(\"[Renew] ✓ Renouvellement terminé\")\nelse:\n    print(f\"[Renew] ✗ Échec (code: {rc})\")\nsys.exit(rc)\nPY\nEOS\nchmod +x /mnt/server/renew.sh\n\necho \"[Install] Création du script post_renew.sh...\"\ncat >/mnt/server/post_renew.sh <<'EOS'\n#!/bin/bash\n# Hook exécuté après renouvellement réussi\n# Exemples:\n#   - Recharger un reverse proxy\n#   - Copier les certificats vers un autre serveur\n#   - Notifier via webhook\n\necho \"[Post-Renew] Hook exécuté\"\necho \"[Post-Renew] Certificats renouvelés: $RENEWED_DOMAINS\"\necho \"[Post-Renew] Chemin: $RENEWED_LINEAGE\"\n\n# Exemple: curl -X POST https://example.com/webhook?renewed=$RENEWED_DOMAINS\n\nexit 0\nEOS\nchmod +x /mnt/server/post_renew.sh\n\necho \"[Install] ✓ Installation terminée\"\necho \"[Install] Scripts créés:\"\necho \"  - start.sh (génération initiale)\"\necho \"  - renew.sh (renouvellement)\"\necho \"  - post_renew.sh (hook personnalisable)\"\n\nexit 0\n",
+      "container": "ghcr.io/parkervcp/installers:debian",
+      "entrypoint": "bash"
+    }
+  },
+  "variables": [
+    {
+      "name": "EMAIL",
+      "description": "Adresse email pour Let's Encrypt (obligatoire).",
+      "env_variable": "EMAIL",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:128"
+    },
+    {
+      "name": "DOMAINS",
+      "description": "Domaines séparés par des virgules (ex: example.com,*.example.com).",
+      "env_variable": "DOMAINS",
+      "default_value": "example.com,*.example.com",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string"
+    },
+    {
+      "name": "CF_API_TOKEN",
+      "description": "Token API Cloudflare (Zone DNS: Edit) limité à ta zone. Masqué côté panel.",
+      "env_variable": "CF_API_TOKEN",
+      "default_value": "",
+      "user_viewable": false,
+      "user_editable": true,
+      "rules": "required|string|max:4096"
+    },
+    {
+      "name": "DNS_PROPAGATION_SECONDS",
+      "description": "Temps d'attente de propagation DNS (ex: 60, 120).",
+      "env_variable": "DNS_PROPAGATION_SECONDS",
+      "default_value": "60",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:0|max:600"
+    },
+    {
+      "name": "STAGING",
+      "description": "1 = environnement de test Let's Encrypt (évite le rate limit en phase d'essai). Mettre à 0 pour la prod.",
+      "env_variable": "STAGING",
+      "default_value": "0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1"
+    },
+    {
+      "name": "KEEP_ALIVE",
+      "description": "1 = garder le container en vie (sinon s'arrête après l'émission).",
+      "env_variable": "KEEP_ALIVE",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|in:0,1"
+    }
+  ]
+}
